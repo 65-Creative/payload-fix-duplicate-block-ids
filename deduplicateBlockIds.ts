@@ -2,70 +2,55 @@ import type { CollectionBeforeChangeHook } from 'payload'
 import { randomUUID } from 'crypto'
 
 /**
- * Recursively walks all nested objects and arrays, replacing every string `id`
- * field with a fresh UUID v4. This covers blocks, inline arrays, and any
- * nested structure Payload CMS generates for Drizzle/PostgreSQL.
- *
- * Why replace ALL IDs (not just duplicates)?
- * Because we can't know which IDs already exist in other locales' rows —
- * Payload merges those AFTER our hook runs. Fresh UUIDs are always safe.
+ * Recursively walks block/array data and assigns a fresh UUID to every
+ * string `id` field found. Uses a WeakSet to safely handle circular
+ * references in Lexical editor data.
  */
-function regenerateAllIds(data: unknown, count = { replaced: 0 }): void {
+function regenerateAllIds(data: unknown, count: { replaced: number }, visited: WeakSet<object>): void {
   if (Array.isArray(data)) {
     for (const item of data) {
-      regenerateAllIds(item, count)
+      regenerateAllIds(item, count, visited)
     }
     return
   }
 
   if (data && typeof data === 'object') {
+    if (visited.has(data as object)) return
+    visited.add(data as object)
+
     const obj = data as Record<string, unknown>
     if (typeof obj.id === 'string') {
       obj.id = randomUUID()
       count.replaced++
     }
-    for (const value of Object.values(obj)) {
+    for (const key in obj) {
+      const value = obj[key]
       if (value && typeof value === 'object') {
-        regenerateAllIds(value, count)
+        regenerateAllIds(value, count, visited)
       }
     }
   }
 }
 
 /**
- * Fix: Duplicate Block IDs in Payload CMS v3 (PostgreSQL / Drizzle)
+ * Prevents "Value must be unique" errors on block/array IDs in Payload CMS.
  *
- * Prevents "Wert muss einzigartig sein" / "Value must be unique" /
- * PostgreSQL error 23505 on block `id` columns.
+ * ONLY runs on PUBLISH — not during draft saves or autosave. This prevents
+ * the hook from interfering with editing (changing IDs on every autosave
+ * causes Payload to duplicate array/block items).
  *
- * ## Why two layers?
+ * Block tables use `id` (TEXT) as PRIMARY KEY — must be globally unique
+ * across ALL documents and locales within the same table. Conflicts arise
+ * from copy-paste between locales/pages and Payload's internal locale merge.
  *
- * **Layer 1 — Hook level (incoming data):**
- *   Regenerates every block/array `id` in the data the editor just saved.
- *   This prevents the CURRENT locale's data from clashing.
+ * Strategy:
+ * 1. HOOK LEVEL (publish only): Regenerate ALL block/array string IDs
+ *    with fresh UUIDs in the incoming locale data.
  *
- * **Layer 2 — Adapter level (INSERT batch deduplication):**
- *   Payload's internal `mergeLocaleActions` merges OTHER locales' existing data
- *   from `docWithLocales` AFTER all collection-level hooks have run.
- *   Those merged rows can carry IDs identical to the ones we just generated
- *   (or to each other, if duplicates were already in the DB). The adapter
- *   patch catches these at the last possible moment — right before INSERT.
- *
- * ## Usage
- *
- *   import { deduplicateBlockIds } from './deduplicateBlockIds'
- *
- *   const MyCollection: CollectionConfig = {
- *     slug: 'pages',
- *     hooks: {
- *       beforeChange: [deduplicateBlockIds],
- *     },
- *     fields: [ ... ],
- *   }
- *
- * Register this hook on EVERY collection that has localized `blocks` or
- * `array` fields. The hook is idempotent and safe to run on collections
- * that don't have blocks (it simply won't find any IDs to replace).
+ * 2. ADAPTER LEVEL (always active): Monkey-patch the Drizzle adapter's
+ *    `insert` method to regenerate ALL string IDs at INSERT time.
+ *    This catches IDs from other locales injected by Payload's locale
+ *    merge AFTER the beforeChange hook.
  */
 export const deduplicateBlockIds: CollectionBeforeChangeHook = async ({
   data,
@@ -76,47 +61,70 @@ export const deduplicateBlockIds: CollectionBeforeChangeHook = async ({
 }) => {
   if (!data) return data
 
-  const currentLocale = req.locale
-  const count = { replaced: 0 }
+  // Only regenerate IDs when publishing — skip draft saves and autosave
+  // to prevent duplicating array/block items during editing
+  const isPublish = data._status === 'published'
 
-  // ── Layer 1: Regenerate all block/array IDs in the incoming locale data ──
-  regenerateAllIds(data, count)
+  if (isPublish) {
+    const currentLocale = req.locale
+    const count = { replaced: 0 }
 
-  if (count.replaced > 0) {
-    req.payload.logger.info(
-      `[deduplicateBlockIds] ${collection.slug}/${originalDoc?.id ?? 'new'} ` +
-        `locale=${currentLocale} op=${operation}: ` +
-        `regenerated ${count.replaced} block/array IDs`,
-    )
+    regenerateAllIds(data, count, new WeakSet())
+
+    if (count.replaced > 0) {
+      req.payload.logger.info(
+        `[deduplicateBlockIds] ${collection.slug}/${originalDoc?.id ?? 'new'} locale=${currentLocale} op=${operation}: ` +
+          `regenerated ${count.replaced} block/array IDs`,
+      )
+    }
   }
 
-  // ── Layer 2: Monkey-patch adapter insert to deduplicate IDs in batches ──
+  // Layer 2: Monkey-patch adapter insert to regenerate ALL string IDs.
+  // Active for ALL saves (including drafts) because the DB constraint
+  // applies regardless of publish status. This layer is safe because it
+  // operates on the flattened DB rows (not the document data structure),
+  // so it cannot cause item duplication in the admin UI.
   const adapter = req.payload.db as any
-  if (!adapter._insertPatched) {
+  if (!adapter._insertPatched_v5) {
     const originalInsert = adapter.insert.bind(adapter)
 
     adapter.insert = async (args: any) => {
-      if (Array.isArray(args.values) && args.values.length > 1) {
-        const seen = new Set<string>()
+      const logger = adapter.payload?.logger
+
+      // Regenerate ALL string IDs in every insert batch.
+      // Main document tables use numeric IDs (unaffected).
+      // Block/array tables use string IDs — these get fresh UUIDs to
+      // prevent cross-document collisions from copied block content.
+      if (Array.isArray(args.values)) {
         for (const row of args.values) {
           if (typeof row?.id === 'string') {
-            if (seen.has(row.id)) {
-              const oldId = row.id
-              row.id = randomUUID()
-              req.payload.logger.info(
-                `[deduplicateBlockIds] Fixed duplicate in INSERT batch ` +
-                  `for ${args.tableName}: ${oldId} -> ${row.id}`,
-              )
-            } else {
-              seen.add(row.id)
-            }
+            row.id = randomUUID()
           }
         }
+      } else if (args.values && typeof args.values === 'object' && typeof args.values.id === 'string' && !args.onConflictDoUpdate) {
+        args.values.id = randomUUID()
       }
-      return originalInsert(args)
-    }
 
-    adapter._insertPatched = true
+      try {
+        return await originalInsert(args)
+      } catch (error: any) {
+        if (error?.code === '23505' || error?.cause?.code === '23505') {
+          const pgError = error?.cause ?? error
+          try {
+            logger?.error(
+              `[deduplicateBlockIds] PG unique violation! ` +
+                `table=${args.tableName} constraint=${pgError.constraint} ` +
+                `detail=${pgError.detail} ` +
+                `batchSize=${Array.isArray(args.values) ? args.values.length : 1}`,
+            )
+          } catch {
+            // Logging failure must not hide the original error
+          }
+        }
+        throw error
+      }
+    }
+    adapter._insertPatched_v5 = true
   }
 
   return data
